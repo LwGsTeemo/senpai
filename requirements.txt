@@ -1,0 +1,16 @@
+numpy
+tqdm
+nibabel
+ml-collections
+matplotlib
+pillow
+torch
+torchaudio
+torchsummary
+pytorch-ignite
+scipy
+scikit-image
+opencv-python-headless
+https://github.com/VincentStimper/mclahe/archive/numpy.zip
+setuptools
+easydict

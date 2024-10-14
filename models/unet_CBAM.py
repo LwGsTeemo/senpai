@@ -1,0 +1,204 @@
+import torch
+from torch import nn
+
+from .init_weights import init_weights
+from .modules import CBAM
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, bottleneck = False) -> None:
+        super(ConvBlock, self).__init__()
+        self.encode = nn.Sequential(
+            nn.Conv3d(in_channels= in_channels, out_channels=out_channels//2, kernel_size=3, padding=1),
+            nn.BatchNorm3d(num_features=out_channels//2),
+            nn.ReLU(),
+            nn.Conv3d(in_channels= out_channels//2, out_channels=out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(num_features=out_channels),
+            nn.ReLU(),
+        )
+        self.bottleneck = bottleneck
+        if not bottleneck:
+            self.pooling = nn.MaxPool3d(kernel_size=2, stride=2)
+    
+    def forward(self, x):
+        res = self.encode(x)
+        out = None
+        if not self.bottleneck:
+            out = self.pooling(res)
+        else:
+            out = res
+        return out, res
+
+class UpConvBlock(nn.Module):
+    def __init__(self, in_channels, res_channels=0, last_layer=False, num_classes=None) -> None:
+        super(UpConvBlock, self).__init__()
+        assert (last_layer==False and num_classes==None) or (last_layer==True and num_classes!=None), 'Invalid arguments'
+        self.upconv1 = nn.ConvTranspose3d(in_channels=in_channels, out_channels=in_channels, kernel_size=2, stride=2)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm3d(num_features=in_channels//2)
+        self.conv1 = nn.Conv3d(in_channels=in_channels+res_channels, out_channels=in_channels//2, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv3d(in_channels=in_channels//2, out_channels=in_channels//2, kernel_size=3, padding=1)
+        self.last_layer = last_layer
+        if last_layer:
+            self.conv3 = nn.Conv3d(in_channels=in_channels//2, out_channels=num_classes, kernel_size=1)
+        
+        self.cbam = CBAM(inplanes=res_channels, planes=res_channels)
+            
+    def forward(self, input, residual=None):
+        out = self.upconv1(input)
+        
+        residual = self.cbam(residual)
+        if residual != None: out = torch.cat((out, residual), 1)
+        out = self.relu(self.bn(self.conv1(out)))
+        out = self.relu(self.bn(self.conv2(out)))
+        if self.last_layer: out = self.conv3(out)
+        return out
+
+class UNet_CBAM(nn.Module):
+    def __init__(self, in_channels, num_classes, level_channels=[64, 128, 256, 512], bottleneck_channel=1024, deep_supervision=False):
+        super(UNet_CBAM, self).__init__()
+        self.ds = deep_supervision
+        level_1_chnls, level_2_chnls, level_3_chnls, level_4_chnls = level_channels[0], level_channels[1], level_channels[2], level_channels[3]
+        self.a_block1 = ConvBlock(in_channels=in_channels, out_channels=level_1_chnls)
+        self.a_block2 = ConvBlock(in_channels=level_1_chnls, out_channels=level_2_chnls)
+        self.a_block3 = ConvBlock(in_channels=level_2_chnls, out_channels=level_3_chnls)
+        self.a_block4 = ConvBlock(in_channels=level_3_chnls, out_channels=level_4_chnls)
+        self.bottleNeck = ConvBlock(in_channels=level_4_chnls, out_channels=bottleneck_channel, bottleneck=True)
+        self.s_block4 = UpConvBlock(in_channels=bottleneck_channel, res_channels=level_4_chnls)
+        self.s_block3 = UpConvBlock(in_channels=level_4_chnls, res_channels=level_3_chnls)
+        self.s_block2 = UpConvBlock(in_channels=level_3_chnls, res_channels=level_2_chnls)
+        self.s_block1 = UpConvBlock(in_channels=level_2_chnls, res_channels=level_1_chnls, num_classes=num_classes, last_layer=True)
+        
+        # SUP
+        self.upscore5 = nn.Upsample(scale_factor=16,mode='trilinear')
+        self.upscore4 = nn.Upsample(scale_factor=8,mode='trilinear')
+        self.upscore3 = nn.Upsample(scale_factor=4,mode='trilinear')
+        self.upscore2 = nn.Upsample(scale_factor=2, mode='trilinear')
+        
+        self.outconv5 = nn.Conv3d(bottleneck_channel, num_classes, 3, padding=1)
+        self.outconv4 = nn.Conv3d(level_4_chnls, num_classes, 3, padding=1)
+        self.outconv3 = nn.Conv3d(level_3_chnls, num_classes, 3, padding=1)
+        self.outconv2 = nn.Conv3d(level_2_chnls, num_classes, 3, padding=1)
+
+        # initialise weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                init_weights(m, init_type='kaiming')
+            elif isinstance(m, nn.BatchNorm3d):
+                init_weights(m, init_type='kaiming')
+
+    def forward(self, input):
+        out, residual_level1 = self.a_block1(input)
+        out, residual_level2 = self.a_block2(out)
+        out, residual_level3 = self.a_block3(out)
+        out, residual_level4 = self.a_block4(out)
+        out, _ = self.bottleNeck(out)
+        d5 = self.outconv5(out)
+        d5 = self.upscore5(d5)
+
+        out = self.s_block4(out, residual_level4)
+        d4 = self.outconv4(out)
+        d4 = self.upscore4(d4)
+        
+        out = self.s_block3(out, residual_level3)
+        d3 = self.outconv3(out)
+        d3 = self.upscore3(d3)
+        
+        out = self.s_block2(out, residual_level2)
+        d2 = self.outconv2(out)
+        d2 = self.upscore2(d2)
+        
+        out = self.s_block1(out, residual_level1)
+        
+        if self.ds:
+            return [out, d2, d3, d4, d5]
+        else:
+            return out
+
+class UpBlock_reduce(nn.Module):
+    def __init__(self, in_channels, out_channels, res_channels=0, last_layer=False, num_classes=None) -> None:
+        super(UpBlock_reduce, self).__init__()
+        assert (last_layer==False and num_classes==None) or (last_layer==True and num_classes!=None), 'Invalid arguments'
+        self.upconv1 = nn.ConvTranspose3d(in_channels=in_channels, out_channels=in_channels, kernel_size=2, stride=2)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm3d(num_features=out_channels)
+        self.conv1 = nn.Conv3d(in_channels=in_channels+res_channels, out_channels=out_channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv3d(in_channels=out_channels, out_channels=out_channels, kernel_size=3, padding=1)
+        self.last_layer = last_layer
+        if last_layer:
+            self.conv3 = nn.Conv3d(in_channels=out_channels, out_channels=num_classes, kernel_size=1)
+        
+        self.cbam = CBAM(inplanes=res_channels, planes=res_channels)
+        
+    def forward(self, input, residual=None):
+        out = self.upconv1(input)
+        
+        residual = self.cbam(residual)
+        if residual != None: out = torch.cat((out, residual), 1)
+        out = self.relu(self.bn(self.conv1(out)))
+        out = self.relu(self.bn(self.conv2(out)))
+        if self.last_layer: out = self.conv3(out)
+        return out
+
+class UNet_CBAM_asy(nn.Module):
+    def __init__(self, in_channels, num_classes, level_channels=[64, 128, 256, 512], bottleneck_channel=1024, deep_supervision=False):
+        super(UNet_CBAM_asy, self).__init__()
+        self.ds = deep_supervision
+        level_1_chnls, level_2_chnls, level_3_chnls, level_4_chnls = level_channels[0], level_channels[1], level_channels[2], level_channels[3]
+        self.a_block1 = ConvBlock(in_channels=in_channels, out_channels=level_1_chnls)
+        self.a_block2 = ConvBlock(in_channels=level_1_chnls, out_channels=level_2_chnls)
+        self.a_block3 = ConvBlock(in_channels=level_2_chnls, out_channels=level_3_chnls)
+        self.a_block4 = ConvBlock(in_channels=level_3_chnls, out_channels=level_4_chnls)
+        self.bottleNeck = ConvBlock(in_channels=level_4_chnls, out_channels=bottleneck_channel, bottleneck=True)
+        
+        self.CatChannels = level_channels[2]
+        
+        self.s_block4 = UpBlock_reduce(in_channels=bottleneck_channel, out_channels=self.CatChannels, res_channels=level_4_chnls)
+        self.s_block3 = UpBlock_reduce(in_channels=self.CatChannels, out_channels=self.CatChannels, res_channels=level_3_chnls)
+        self.s_block2 = UpBlock_reduce(in_channels=self.CatChannels, out_channels=self.CatChannels, res_channels=level_2_chnls)
+        self.s_block1 = UpBlock_reduce(in_channels=self.CatChannels, out_channels=self.CatChannels, res_channels=level_1_chnls, num_classes=num_classes, last_layer=True)
+        
+        # SUP
+        self.upscore5 = nn.Upsample(scale_factor=16,mode='trilinear')
+        self.upscore4 = nn.Upsample(scale_factor=8,mode='trilinear')
+        self.upscore3 = nn.Upsample(scale_factor=4,mode='trilinear')
+        self.upscore2 = nn.Upsample(scale_factor=2, mode='trilinear')
+        
+        self.outconv5 = nn.Conv3d(bottleneck_channel, num_classes, 3, padding=1)
+        self.outconv4 = nn.Conv3d(self.CatChannels, num_classes, 3, padding=1)
+        self.outconv3 = nn.Conv3d(self.CatChannels, num_classes, 3, padding=1)
+        self.outconv2 = nn.Conv3d(self.CatChannels, num_classes, 3, padding=1)
+
+        # initialise weights
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                init_weights(m, init_type='kaiming')
+            elif isinstance(m, nn.BatchNorm3d):
+                init_weights(m, init_type='kaiming')
+
+    def forward(self, input):
+        out, residual_level1 = self.a_block1(input)
+        out, residual_level2 = self.a_block2(out)
+        out, residual_level3 = self.a_block3(out)
+        out, residual_level4 = self.a_block4(out)
+        out, _ = self.bottleNeck(out)
+        d5 = self.outconv5(out)
+        d5 = self.upscore5(d5)
+
+        out = self.s_block4(out, residual_level4)
+        d4 = self.outconv4(out)
+        d4 = self.upscore4(d4)
+        
+        out = self.s_block3(out, residual_level3)
+        d3 = self.outconv3(out)
+        d3 = self.upscore3(d3)
+        
+        out = self.s_block2(out, residual_level2)
+        d2 = self.outconv2(out)
+        d2 = self.upscore2(d2)
+        
+        out = self.s_block1(out, residual_level1)
+        
+        if self.ds:
+            return [out, d2, d3, d4, d5]
+        else:
+            return out
